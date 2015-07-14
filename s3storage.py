@@ -14,7 +14,7 @@ as long as you restart your app server after running collectstatic.
 
 --------------------------------------------------------------------------------
 
-Copyright (c) 2008-2012 Morningstar Enterprises Inc., Alan Justino da Silva,
+Copyright (c) 2008-2013 Morningstar Enterprises Inc., Alan Justino da Silva,
  and authors listed in the django-storages AUTHORS file and the django-storages
 public CMS repository. All rights reserved.
 
@@ -59,6 +59,7 @@ except ImportError:
     from StringIO import StringIO  # noqa
 
 from django.conf import settings
+from django.core.cache import cache
 from django.core.files.base import File
 from django.core.files.storage import Storage
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
@@ -68,7 +69,7 @@ try:
     from boto.s3.connection import S3Connection, SubdomainCallingFormat
     from boto.exception import S3ResponseError
     from boto.s3.key import Key
-    from boto.utils import parse_ts
+    from boto.utils import parse_ts, get_ts
 except ImportError:
     raise ImproperlyConfigured("Could not load Boto's S3 bindings.\n"
                                "See http://code.google.com/p/boto/")
@@ -137,12 +138,6 @@ def safe_join(base, *paths):
 
 CachedKey = namedtuple('CachedKey', 'size last_modified') # storing actual Key objects uses way too much memory
 
-cached_entries = {} # dict where key is bucket name, value is a dict of
-                    # CachedKey objects. This is to reduce memory usage and
-                    # increase speed when multiple S3BotoStorage objects exist
-                    # for the same bucket (allows use of prefixes, differing
-                    # redundancy settings, etc. )
-
 class S3BotoStorage(Storage):
     """
     Amazon Simple Storage Service using Boto
@@ -186,7 +181,33 @@ class S3BotoStorage(Storage):
 
         self.connection = S3Connection(access_key, secret_key,
             calling_format=calling_format)
-        self._entries = None
+
+    # Cache management:
+    CACHE_TIME = 157680000  # Store S3 file (key) entries in the cache for five years
+
+    def _cache_key(self, key_name):
+        """ Given an S3 key name (file path), return a full cache
+            key to be stored in memcache etc. """
+        key_unescaped = 's3storage:{}:{}'.format(self.bucket_name, key_name)
+        # Memcached doesn't allow spaces, so we replace them with a caret:
+        return key_unescaped.replace(' ', '^')
+
+    def _cache_get(self, s3_key_name):
+        " Fetch a CachedKey (minimal object compatible with boto.s3.key.Key) "
+        cached = cache.get(self._cache_key(s3_key_name))
+        if not cached:
+            raise KeyError
+        size, last_modified = cached
+        return CachedKey(size, last_modified)
+
+    def _cache_set(self, s3_key_name, s3_key):
+        " Save the size and last_modified information from 's3_key' into the cache "
+        size = s3_key.size  # Size of the s3 file (key) in bytes. Integer.
+        last_modified = s3_key.last_modified  # mtime date expressed as a string. Format varies.
+        cache.set(self._cache_key(s3_key_name), (size, last_modified), self.CACHE_TIME)
+
+    def _cache_delete(self, s3_key_name):
+        cache.delete(self._cache_key(s3_key_name))
 
     @property
     def bucket(self):
@@ -198,40 +219,42 @@ class S3BotoStorage(Storage):
             self._bucket = self._get_or_create_bucket(self.bucket_name)
         return self._bucket
 
-    @property
-    def entries(self):
-        """
-        Get the cached files for the bucket.
-        """
-        global cached_entries
-        
-        if self._entries is None: # this part only ever gets executed once:
-            if self.preload_metadata:
-                try:
-                    self._entries = cached_entries[self.bucket_name]
-                except KeyError:
-                    self._entries = dict((self._decode_name(entry.key), CachedKey(entry.size, entry.last_modified))
-                                    for entry in self.bucket.list())
-                    cached_entries[self.bucket_name] = self._entries
-            else:
-                self._entries = {}
-        return self._entries
-    
     def _get_key(self, name):
-        """ Get this key from the bucket, if not already in the entries cache """
+        """ Get this key from the bucket, if not already in the cache """
         key_name = self._encode_name(name)
         try:
-            return self.entries[key_name]
+            return self._cache_get(key_name)
         except KeyError:
-            key = self.bucket.get_key(key_name)
-            if key and self.preload_metadata:
-                self.entries[key_name] = CachedKey(key.size, key.last_modified)
-            return key
-    
+            # The key is not in our cache.
+            if self.preload_metadata:
+                # When self.preload_metadata is true AND the cache has been preloaded,
+                # our cache should always be correct.
+                # Have we preloaded the cache?
+                HAS_PRELOADED = 's3storage:{}:__HAS_PRELOADED'.format(self.bucket_name)
+                if cache.get(HAS_PRELOADED):
+                    # Yes, we have preloaded all s3 keys. Thus, we can trust the cache
+                    # and say for sure that the file doesn't exist (unless modified)
+                    # on the S3 server by some external user
+                    return None
+                else:
+                    # Preload a list of all keys (files) in the S3 bucket:
+                    for entry in self.bucket.list():
+                        key_name = self._decode_name(entry.key)
+                        self._cache_set(key_name, entry)
+                    cache.set(HAS_PRELOADED, True, self.CACHE_TIME)
+                    try:
+                        return self._cache_get(key_name)
+                    except KeyError:
+                        return None
+            else:
+                # Load the key from the S3 server since it's not in the cache and we do
+                # not preload/cache metadata:
+                return self.bucket.get_key(key_name)
+
     def _delete_key(self, name):
-        """ Delete this key from the bucket and from the entries """
+        """ Delete this key from the bucket and from the cache """
         key_name = self._encode_name(name)
-        self.entries.pop(key_name, None) # Remove from preloaded cache, if we're using that
+        self._cache_delete(key_name)  # Remove from preloaded cache, if we're using that
         self.bucket.delete_key(key_name)
 
     def _get_access_keys(self):
@@ -330,11 +353,10 @@ class S3BotoStorage(Storage):
         key.set_contents_from_file(content, headers=headers, policy=self.acl,
                                  reduced_redundancy=self.reduced_redundancy)
         if self.preload_metadata:
-            #self.entries[encoded_name] = CachedKey(key.size, key.last_modified)
+            #self._cache_set(encoded_name, key)
             # The above doesn't work because 'last_modified' doesn't get updated
-            # when boto does an S3 PUT request :-( so instead, we invalidate the
-            # cache, so next time, we'll load new metadata with a HEAD request:
-            self.entries.pop(encoded_name, None)
+            # when boto does an S3 PUT request :-( so instead, we fake it:
+            self._cache_set(encoded_name, CachedKey(key.size, get_ts()))
         return cleaned_name
 
     def delete(self, name):
@@ -344,13 +366,7 @@ class S3BotoStorage(Storage):
     def exists(self, name):
         name = self._normalize_name(self._clean_name(name))
         key_name = self._encode_name(name)
-        if self.entries and key_name in self.entries:
-            return True
-        k = self.bucket.get_key(key_name)
-        if k:
-            if self.entries:
-                # Update this key in the cache; it has been created in another process
-                self.entries[key_name] = CachedKey(k.size, k.last_modified)
+        if self._get_key(key_name):
             return True
         return False
 
